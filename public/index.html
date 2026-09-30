@@ -23,12 +23,16 @@
   <main>
     <!-- ========== 素材与来源 ========== -->
     <section id="tab-materials" class="tabpanel active">
-      <div class="toolbar">
+      <div class="toolbar toolbar-flex">
         <form id="addMaterialForm" class="inline-form">
           <input name="title" placeholder="素材名称（必填）" required />
           <input name="kind" placeholder="类型，如 video / audio / image / font" class="w-10" />
           <button class="btn" type="submit">＋ 登记素材</button>
         </form>
+        <label class="preview-toggle" title="开启后，授权/来源关系的增改撤删将先弹出影响预演，确认后才真正提交">
+          <input type="checkbox" id="previewMode" checked />
+          授权 / 来源变更先做影响预演，再确认提交
+        </label>
       </div>
       <div id="materialsList" class="grid"></div>
     </section>
@@ -65,7 +69,7 @@
     </section>
   </main>
 
-  <!-- 快照查看弹层 -->
+  <!-- 快照查看 / 影响预演弹层 -->
   <div id="modalBackdrop" class="modal-backdrop hidden">
     <div class="modal">
       <div class="modal-head">
@@ -73,6 +77,7 @@
         <button class="btn" id="modalClose">关闭</button>
       </div>
       <div id="modalBody" class="modal-body"></div>
+      <div id="modalFoot" class="modal-foot hidden"></div>
     </div>
   </div>
 

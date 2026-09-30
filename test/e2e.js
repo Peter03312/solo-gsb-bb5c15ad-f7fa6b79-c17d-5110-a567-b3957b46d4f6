@@ -223,6 +223,149 @@ async function call(method, url, body) {
       '早一天即不覆盖整段使用期');
   }
 
+  console.log('10) 变更影响预演 + 确认提交（先预演后提交，事务内校验）');
+  {
+    // 自建一套干净数据：root -> src 两节点，各自恰好一份覆盖授权，发布一个合格包
+    const m1 = (await call('POST', '/api/materials', { title: '预演-成片', kind: 'video' })).data.id;
+    const m2 = (await call('POST', '/api/materials', { title: '预演-来源', kind: 'audio' })).data.id;
+    const m3 = (await call('POST', '/api/materials', { title: '预演-无授权素材', kind: 'image' })).data.id;
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m2, relation: '配乐' });
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 'r',
+    });
+    const aSrc = (await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 's',
+    })).data.id;
+    const pkg = (await call('POST', '/api/packages', {
+      name: '预演测试包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-03-01', useTo: '2026-04-30', materialIds: [m1],
+    })).data.id;
+    const v0 = await call('POST', '/api/verify', { packageId: pkg });
+    const pub0 = await call('POST', `/api/packages/${pkg}/publish`, { basisVersion: v0.data.basisVersion });
+    ok(pub0.status === 201, '前置：预演测试包已发布');
+    const basis0 = pub0.data.result.basisVersion;
+    global.previewPkg = pkg; global.previewAuth = aSrc; global.previewRoot = m1;
+    global.previewNoAuth = m3; global.previewSrc = m2;
+
+    // 10.1 预演撤销来源授权：列出该已发布包 + 问题节点 m2 + revoked 原因与来源路径
+    const pv = await call('POST', '/api/changes/preview', { operation: 'authorization.revoke', authorizationId: aSrc });
+    ok(pv.status === 200, '预演返回 200');
+    ok(pv.data.mutated === false && pv.data.basisVersion === basis0, '预演返回依据版本且声明未落库');
+    const hit = pv.data.impact.find((p) => p.packageId === pkg);
+    ok(!!hit, '预演影响清单含该已发布包');
+    const badNode = hit && hit.failingNodes.find((n) => n.materialId === m2);
+    ok(!!badNode && badNode.reasons.includes('revoked'), '问题节点为来源 m2，原因为授权均已撤销');
+    ok(badNode.paths.some((p) => p.map((x) => x.materialId).join() === `${m1},${m2}`),
+      '给出问题节点来源路径 root->src');
+    ok(typeof pv.data.impactFingerprint === 'string' && pv.data.impactFingerprint.length > 0, '返回影响清单指纹');
+
+    // 10.2 预演不落库：包仍 published、快照仍只有发布快照、授权未撤销、版本不变
+    const st1 = await call('GET', `/api/packages/${pkg}`);
+    ok(st1.data.status === 'published' && st1.data.snapshots.length === 1, '预演后包仍已发布且无新增快照');
+    const mats1 = await call('GET', '/api/materials');
+    const stillActive = mats1.data.find((x) => x.id === m2).authorizations.find((a) => a.id === aSrc && !a.revoked);
+    ok(!!stillActive, '预演后授权仍未撤销');
+    const ver1 = (await call('GET', '/api/state')).data.basisVersion;
+    ok(ver1 === basis0, '预演后依据版本不变');
+
+    // 10.3 依据版本不一致 -> 409 STALE_BASIS，无写入
+    const stale = await call('POST', '/api/changes/commit', {
+      operation: 'authorization.revoke', authorizationId: aSrc, basisVersion: basis0 - 1, impact: pv.data.impact,
+    });
+    ok(stale.status === 409 && stale.data.details.code === 'STALE_BASIS', '旧依据版本确认被拒 409 STALE_BASIS');
+    ok((await call('GET', `/api/packages/${pkg}`)).data.status === 'published', 'STALE 拒绝后无部分写入');
+
+    // 10.4 影响清单不一致（提交空清单）-> 409 IMPACT_MISMATCH，无写入
+    const mismatch = await call('POST', '/api/changes/commit', {
+      operation: 'authorization.revoke', authorizationId: aSrc, basisVersion: basis0, impact: [],
+    });
+    ok(mismatch.status === 409 && mismatch.data.details.code === 'IMPACT_MISMATCH', '影响清单不符被拒 409 IMPACT_MISMATCH');
+    ok(Array.isArray(mismatch.data.details.impact) && mismatch.data.details.impact.some((p) => p.packageId === pkg),
+      '拒绝时返回服务端重算的最新影响清单');
+    ok((await call('GET', `/api/packages/${pkg}`)).data.status === 'published', 'MISMATCH 拒绝后无部分写入');
+
+    // 10.5 正确确认：执行变更 + 标需复核 + 追加不可变 review 快照，原发布快照保留
+    const commit = await call('POST', '/api/changes/commit', {
+      operation: 'authorization.revoke', authorizationId: aSrc, basisVersion: basis0, impact: pv.data.impact,
+    });
+    ok(commit.status === 200 && commit.data.mutated === true, '携带同一操作与预演结果确认成功');
+    ok(commit.data.basisVersion === basis0 + 1, '提交后依据版本 +1');
+    const st2 = await call('GET', `/api/packages/${pkg}`);
+    ok(st2.data.status === 'needs_review', '受影响包标记为 needs_review');
+    ok(st2.data.snapshots.length === 2 &&
+       st2.data.snapshots[0].kind === 'publish' && st2.data.snapshots[0].eligible === true &&
+       st2.data.snapshots[1].kind === 'review' && st2.data.snapshots[1].eligible === false,
+      '原发布快照保留，并追加不合格 review 快照');
+
+    // 10.6 需复核包不自动恢复（即便预演显示已合格），且预演只统计“已发布合格”包
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '*', region: '*', validFrom: '2020-01-01', validTo: '2031-12-31', licensor: '补',
+    });
+    const st3 = await call('GET', `/api/packages/${pkg}`);
+    ok(st3.data.status === 'needs_review', '补正授权后需复核包不自动恢复');
+
+    // 10.7 目标失效：预演删不存在授权 404；确认时目标已被删 409 TARGET_GONE
+    const pvGonePreview = await call('POST', '/api/changes/preview', { operation: 'authorization.delete', authorizationId: 999999 });
+    ok(pvGonePreview.status === 404, '预演不存在的目标返回 404');
+
+    // 10.8 成环拒绝（预演阶段即拒绝，沿用既有成环校验与路径）
+    const cyc = await call('POST', '/api/changes/preview', { operation: 'source.create', materialId: m2, sourceMaterialId: m1 });
+    ok(cyc.status === 409 && cyc.data.details.code === 'CYCLE' &&
+       cyc.data.details.cycle.join() === `${m2},${m1},${m2}`,
+      '成环关系在预演时即被拒绝并返回完整闭环');
+
+    // 10.9 输入非法 -> 400（字段/校验沿用既有接口：空媒介、起止倒置）
+    const bad1 = await call('POST', '/api/changes/preview', {
+      operation: 'authorization.create', materialId: m1, media: '', region: 'CN',
+      validFrom: '2026-01-01', validTo: '2026-12-31',
+    });
+    const bad2 = await call('POST', '/api/changes/preview', {
+      operation: 'authorization.update', authorizationId: aSrc, media: '*', region: '*',
+      validFrom: '2026-12-31', validTo: '2026-01-01',
+    });
+    const bad3 = await call('POST', '/api/changes/preview', { operation: 'source.create', materialId: m1, sourceMaterialId: m1 });
+    ok(bad1.status === 400 && bad2.status === 400 && bad3.status === 400,
+      '空媒介 / 起止倒置 / 自环均按既有校验返回 400');
+
+    // 10.10 来源关系新增：预演 -> 确认，包由合格转不合格（挂入无授权素材）
+    // 先人工复核恢复包（补过授权），使其回到 published
+    const rc = await call('POST', `/api/packages/${pkg}/recheck`);
+    ok(rc.data.restored === true, '前置：人工复核恢复为已发布');
+    const basisBeforeLink = (await call('GET', '/api/state')).data.basisVersion;
+    const pvLink = await call('POST', '/api/changes/preview', {
+      operation: 'source.create', materialId: m1, sourceMaterialId: m3, relation: '引用',
+    });
+    ok(pvLink.status === 200 && pvLink.data.impact.some((p) =>
+      p.packageId === pkg && p.failingNodes.some((n) => n.materialId === m3 && n.reasons.includes('no_auth'))),
+      '预演新增到无授权素材的边：包将因 m3 无授权不合格');
+    const commitLink = await call('POST', '/api/changes/commit', {
+      operation: 'source.create', materialId: m1, sourceMaterialId: m3, relation: '引用',
+      basisVersion: basisBeforeLink, impact: pvLink.data.impact,
+    });
+    ok(commitLink.status === 200, '来源新增确认成功');
+    ok((await call('GET', `/api/packages/${pkg}`)).data.status === 'needs_review',
+      '挂入无授权来源后包被标记需复核');
+
+    // 10.11 来源关系删除：删除该坏边预演影响为 0（删除来源不会使已发布合格包变坏），确认后恢复原链
+    const linkId = (await call('GET', `/api/materials/${m1}`)).data.sources.find((s) => s.sourceMaterialId === m3).id;
+    const pvDelLink = await call('POST', '/api/changes/preview', { operation: 'source.delete', linkId });
+    ok(pvDelLink.status === 200 && pvDelLink.data.impact.length === 0, '删除坏来源边预演影响为 0');
+    const commitDelLink = await call('POST', '/api/changes/commit', {
+      operation: 'source.delete', linkId, basisVersion: pvDelLink.data.basisVersion, impact: [],
+    });
+    ok(commitDelLink.status === 200, '来源删除确认成功（无包转不合格）');
+    const sourcesAfter = (await call('GET', `/api/materials/${m1}`)).data.sources;
+    ok(!sourcesAfter.some((s) => s.sourceMaterialId === m3), '坏来源边已删除');
+    // 10.12 再次预演同操作：目标（边）已失效 -> 404
+    const pvGoneLink = await call('POST', '/api/changes/preview', { operation: 'source.delete', linkId });
+    ok(pvGoneLink.status === 404, '删除后再预演同一条边返回 404 目标失效');
+
+    // 10.13 既有编辑接口请求/返回保持兼容（直接 PATCH/DELETE 不经预演仍可用）
+    const patch = await call('PATCH', `/api/authorizations/${aSrc}`, { region: '中国香港' });
+    ok(patch.status === 200 && patch.data.region === '中国香港' && patch.data.id === aSrc,
+      '既有 PATCH /api/authorizations/:id 兼容可用');
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -10,6 +10,7 @@ const {
   verifyPackage,
   revalidatePublished,
 } = require('./verify');
+const { previewChange, commitChange, ChangeError } = require('./changes');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -546,6 +547,36 @@ app.post('/api/packages/:id/recheck', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 变更影响预演 / 确认提交（馆员对单笔授权或单条来源关系先预演再确认） ----------
+// 请求字段沿用对应既有编辑接口；预演只读不落库，确认在事务内核版本、重算并比对影响清单。
+app.post('/api/changes/preview', (req, res, next) => {
+  try {
+    const result = previewChange(db, req.body || {});
+    res.json({
+      ok: true,
+      phase: 'preview',
+      message: result.impact.length
+        ? `预演完成：该变更将使 ${result.impact.length} 个已发布展览包由合格转为不合格（需复核）。预演未改动任何数据。`
+        : '预演完成：该变更不会使任何已发布展览包转为不合格。预演未改动任何数据。',
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/changes/commit', (req, res, next) => {
+  try {
+    const result = commitChange(db, req.body || {});
+    res.json({
+      ok: true,
+      phase: 'commit',
+      message: result.impact.length
+        ? `变更已执行：${result.impact.length} 个已发布包被标记为需复核并已追加不可变复核快照；需复核包不会自动恢复。`
+        : '变更已执行：无已发布包受影响，未产生需复核标记。',
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 快照 ----------
 app.get('/api/snapshots/:id', (req, res, next) => {
   try {
@@ -566,7 +597,7 @@ app.get('/api/snapshots/:id', (req, res, next) => {
 
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError) {
+  if (err instanceof HttpError || err instanceof ChangeError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {

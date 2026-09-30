@@ -93,7 +93,8 @@ function renderMaterials() {
             .map((x) => `<option value="${x.id}">${esc(x.title)}</option>`).join('')}
         </select>
         <input name="relation" placeholder="关系（如 配乐）" style="width:110px" />
-        <button class="btn btn-small" type="submit">＋ 来源</button>
+        <button class="btn btn-small" type="submit" data-go="save">＋ 来源</button>
+        <button class="btn btn-small btn-primary" type="submit" data-go="preview">预演影响</button>
       </form>
 
       <div class="section-title">授权</div>
@@ -107,6 +108,7 @@ function renderMaterials() {
               <td>${a.revoked ? '<span class="pill pill-bad">已撤销</span>' : '<span class="pill pill-ok">有效</span>'}</td>
               <td>${esc(a.licensor || '')}</td>
               <td class="pkg-actions">
+                <button class="btn btn-small" data-act="edit-auth" data-id="${a.id}">改</button>
                 ${a.revoked ? '' : `<button class="btn btn-small" data-act="revoke" data-id="${a.id}">撤销</button>`}
                 <button class="btn btn-small btn-danger" data-act="del-auth" data-id="${a.id}">删除</button>
               </td>
@@ -114,12 +116,16 @@ function renderMaterials() {
         </table>` : '<span class="small-muted">无授权登记</span>'}
       <form class="mini" data-act="add-auth">
         <input type="hidden" name="materialId" value="${m.id}" />
+        <input type="hidden" name="authorizationId" value="" />
         <input name="media" placeholder="媒介（* 任意）" style="width:100px" required />
         <input name="region" placeholder="地区（* 任意）" style="width:100px" required />
         <input name="validFrom" type="date" required />
         <input name="validTo" type="date" required />
         <input name="licensor" placeholder="授权方" style="width:100px" />
-        <button class="btn btn-small" type="submit">＋ 授权</button>
+        <label class="revoked-edit hidden" title="修改时可直接把授权置为已撤销"><input type="checkbox" name="revoked" /> 已撤销</label>
+        <button class="btn btn-small" type="submit" data-go="save">＋ 授权</button>
+        <button class="btn btn-small btn-primary" type="submit" data-go="preview">预演影响</button>
+        <button class="btn btn-small hidden" type="button" data-act="cancel-edit-auth">取消修改</button>
       </form>
 
       <div class="section-title">被用于</div>
@@ -138,21 +144,95 @@ $('#addMaterialForm').addEventListener('submit', async (e) => {
   } catch (err) { toast(errText(err), true); }
 });
 
+// 依据表单构造变更操作载荷（字段沿用既有编辑接口）
+function authFormChange(form) {
+  const authorizationId = Number(form.authorizationId.value || 0);
+  if (authorizationId) {
+    return {
+      operation: 'authorization.update',
+      authorizationId,
+      media: form.media.value, region: form.region.value,
+      validFrom: form.validFrom.value, validTo: form.validTo.value,
+      licensor: form.licensor.value,
+      revoked: form.revoked.checked,
+    };
+  }
+  return {
+    operation: 'authorization.create',
+    materialId: Number(form.materialId.value),
+    media: form.media.value, region: form.region.value,
+    validFrom: form.validFrom.value, validTo: form.validTo.value,
+    licensor: form.licensor.value,
+  };
+}
+
+function resetAuthForm(form) {
+  form.reset();
+  form.authorizationId.value = '';
+  form.querySelector('[data-go="save"]').textContent = '＋ 授权';
+  form.querySelector('.revoked-edit').classList.add('hidden');
+  form.querySelector('[data-act="cancel-edit-auth"]').classList.add('hidden');
+}
+
+function fillAuthFormForEdit(form, auth) {
+  form.authorizationId.value = auth.id;
+  form.media.value = auth.media;
+  form.region.value = auth.region;
+  form.validFrom.value = auth.validFrom;
+  form.validTo.value = auth.validTo;
+  form.licensor.value = auth.licensor || '';
+  form.revoked.checked = !!auth.revoked;
+  form.querySelector('[data-go="save"]').textContent = '保存修改';
+  form.querySelector('.revoked-edit').classList.remove('hidden');
+  form.querySelector('[data-act="cancel-edit-auth"]').classList.remove('hidden');
+  form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 $('#materialsList').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
+  const card = btn.closest('.card');
   try {
+    if (btn.dataset.act === 'edit-auth') {
+      const matId = Number(card.dataset.id);
+      const mat = state.materials.find((x) => x.id === matId);
+      const auth = mat.authorizations.find((a) => a.id === Number(btn.dataset.id));
+      const form = card.querySelector('form[data-act="add-auth"]');
+      fillAuthFormForEdit(form, auth);
+      return;
+    }
+    if (btn.dataset.act === 'cancel-edit-auth') {
+      resetAuthForm(btn.closest('form'));
+      return;
+    }
+
+    let change = null;
+    let confirmMsg = '';
     if (btn.dataset.act === 'del-link') {
-      if (!confirm('删除该来源关系？（可能影响已发布包资格）')) return;
-      await api('DELETE', `/api/source-links/${btn.dataset.id}`);
-      toast('来源关系已删除，已重新计算已发布包资格');
+      change = { operation: 'source.delete', linkId: Number(btn.dataset.id) };
+      confirmMsg = '删除该来源关系？（可能影响已发布包资格）';
     } else if (btn.dataset.act === 'revoke') {
-      if (!confirm('撤销该授权？依赖它的已发布包将被标记为需复核。')) return;
-      await api('POST', `/api/authorizations/${btn.dataset.id}/revoke`);
-      toast('授权已撤销，已重新计算已发布包资格');
+      change = { operation: 'authorization.revoke', authorizationId: Number(btn.dataset.id) };
+      confirmMsg = '撤销该授权？依赖它的已发布包将被标记为需复核。';
     } else if (btn.dataset.act === 'del-auth') {
-      if (!confirm('删除该授权？此变更不可从快照中追溯恢复。')) return;
-      await api('DELETE', `/api/authorizations/${btn.dataset.id}`);
+      change = { operation: 'authorization.delete', authorizationId: Number(btn.dataset.id) };
+      confirmMsg = '删除该授权？此变更不可从快照中追溯恢复。';
+    }
+    if (!change) return;
+
+    if ($('#previewMode').checked) {
+      await openChangePreview(change);
+      return;
+    }
+    if (!confirm(confirmMsg)) return;
+    if (change.operation === 'source.delete') {
+      await api('DELETE', `/api/source-links/${change.linkId}`);
+      toast('来源关系已删除，已重新计算已发布包资格');
+    } else if (change.operation === 'authorization.revoke') {
+      await api('POST', `/api/authorizations/${change.authorizationId}/revoke`);
+      toast('授权已撤销，已重新计算已发布包资格');
+    } else {
+      await api('DELETE', `/api/authorizations/${change.authorizationId}`);
       toast('授权已删除，已重新计算已发布包资格');
     }
     await loadState();
@@ -163,20 +243,39 @@ $('#materialsList').addEventListener('submit', async (e) => {
   const form = e.target.closest('form[data-act]');
   if (!form) return;
   e.preventDefault();
+  const go = e.submitter && e.submitter.dataset.go === 'preview' ? 'preview' : 'save';
   try {
     if (form.dataset.act === 'add-link') {
-      await api('POST', `/api/materials/${form.materialId.value}/sources`, {
+      const change = {
+        operation: 'source.create',
+        materialId: Number(form.materialId.value),
         sourceMaterialId: Number(form.sourceMaterialId.value),
         relation: form.relation.value,
+      };
+      if (go === 'preview' || $('#previewMode').checked) {
+        await openChangePreview(change, undefined, form);
+        return;
+      }
+      await api('POST', `/api/materials/${change.materialId}/sources`, {
+        sourceMaterialId: change.sourceMaterialId,
+        relation: change.relation,
       });
       toast('来源关系已登记');
     } else if (form.dataset.act === 'add-auth') {
-      await api('POST', `/api/materials/${form.materialId.value}/authorizations`, {
-        media: form.media.value, region: form.region.value,
-        validFrom: form.validFrom.value, validTo: form.validTo.value,
-        licensor: form.licensor.value,
-      });
-      toast('授权已登记');
+      const change = authFormChange(form);
+      if (go === 'preview' || $('#previewMode').checked) {
+        await openChangePreview(change, undefined, form);
+        return;
+      }
+      // 关闭预演模式时沿用既有接口直接保存
+      if (change.operation === 'authorization.update') {
+        await api('PATCH', `/api/authorizations/${change.authorizationId}`, change);
+        toast('授权已修改');
+      } else {
+        await api('POST', `/api/materials/${change.materialId}/authorizations`, change);
+        toast('授权已登记');
+      }
+      resetAuthForm(form);
     }
     await loadState();
   } catch (err) {
@@ -407,6 +506,8 @@ async function openSnapshot(snapshotId) {
     const s = await api('GET', `/api/snapshots/${snapshotId}`);
     $('#modalTitle').textContent =
       `核验快照 #${s.id}（${{ publish: '发布', review: '自动复核', recheck: '人工复核' }[s.kind]}）— 不可变`;
+    $('#modalFoot').classList.add('hidden');
+    $('#modalFoot').innerHTML = '';
     const p = s.payload;
     $('#modalBody').innerHTML = `
       <div class="verdict ${s.eligible ? 'pass' : 'fail'}">
@@ -431,5 +532,114 @@ async function openSnapshot(snapshotId) {
 }
 $('#modalClose').addEventListener('click', () => $('#modalBackdrop').classList.add('hidden'));
 $('#modalBackdrop').addEventListener('click', (e) => { if (e.target.id === 'modalBackdrop') $('#modalBackdrop').classList.add('hidden'); });
+
+// ---- 变更影响预演 + 确认提交 ----
+const OP_LABEL = {
+  'authorization.create': '新增授权',
+  'authorization.update': '修改授权',
+  'authorization.revoke': '撤销授权',
+  'authorization.delete': '删除授权',
+  'source.create': '新增来源关系',
+  'source.delete': '删除来源关系',
+};
+
+function impactNodesHtml(n) {
+  return `
+    <div class="impact-node">
+      <b>${esc(n.title)}</b> <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span>
+      <div>${n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</div>
+      <div class="section-title">不合格来源路径（共 ${n.paths.length} 条）</div>
+      ${n.paths.map((p) => '<div class="path">' + p.map((x, i) =>
+        (i ? ' → ' : '') + `<span class="${x.materialId === n.materialId ? 'fail-node' : ''}">${esc(x.title)}</span>`).join('') + '</div>').join('')}
+    </div>`;
+}
+
+function impactListHtml(impact) {
+  if (!impact.length) {
+    return '<div class="verdict pass" style="margin-top:8px">✓ 该变更不会使任何已发布展览包由合格转为不合格。</div>';
+  }
+  return `<div class="verdict fail" style="margin-top:8px">
+      ✗ 以下 ${impact.length} 个已发布展览包将由合格转为不合格（确认后标记为需复核并追加不可变复核快照，不自动恢复）
+    </div>` + impact.map((p) => `
+    <div class="impact-pkg">
+      <h4>${esc(p.packageName)} <span class="small-muted">#${p.packageId}</span>
+        <span class="pill pill-ok">当前：已发布</span> → <span class="pill pill-bad">确认后：需复核</span></h4>
+      <div class="small-muted">媒介：${esc(p.medium)} ｜ 地区：${esc(p.region)} ｜ 使用期：${p.useFrom} → ${p.useTo}</div>
+      <div class="section-title">问题节点（${p.failingNodes.length} 个）及原因</div>
+      ${p.failingNodes.map(impactNodesHtml).join('')}
+    </div>`).join('');
+}
+
+// 发起预演并打开弹层（sourceForm 为发起预演的表单，成功提交后用于复位）
+async function openChangePreview(change, staleNote, sourceForm) {
+  let preview;
+  try {
+    preview = await api('POST', '/api/changes/preview', change);
+  } catch (err) {
+    if (err.status === 409 && err.details && err.details.cyclePath) {
+      const cycle = err.details.cycle || err.details.cyclePath;
+      const names = cycle.map((id) => {
+        const m = state.materials.find((x) => x.id === id);
+        return m ? m.title : `#${id}`;
+      });
+      toast(`${err.message} 闭环路径：${names.join(' → ')}`, true);
+    } else {
+      toast('预演被拒绝：' + errText(err), true);
+    }
+    return;
+  }
+
+  $('#modalTitle').textContent = `影响预演：${OP_LABEL[preview.operation] || preview.operation}（依据版本 ${preview.basisVersion}）`;
+  $('#modalBody').innerHTML = `
+    ${staleNote ? `<div class="stale-banner">${esc(staleNote)}</div>` : ''}
+    <div class="edit-banner">
+      <span><b>拟执行操作：</b>${esc(preview.summary)}</span>
+      <span class="small-muted">依据版本：<b>${preview.basisVersion}</b></span>
+    </div>
+    <div class="small-muted">预演只读取当前数据，未改动授权、来源关系、包状态或任何快照；请在确认前不要由他人修改授权或来源关系。</div>
+    ${impactListHtml(preview.impact)}`;
+
+  const foot = $('#modalFoot');
+  foot.classList.remove('hidden');
+  foot.innerHTML = `
+    <button class="btn" id="previewCancel">取消（不做任何改动）</button>
+    <button class="btn" id="previewReplay">重新预演</button>
+    <button class="btn btn-primary" id="previewConfirm">确认提交同一操作及预演结果</button>`;
+  $('#previewCancel').addEventListener('click', () => $('#modalBackdrop').classList.add('hidden'));
+  $('#previewReplay').addEventListener('click', () => openChangePreview(change, undefined, sourceForm));
+  $('#previewConfirm').addEventListener('click', () => commitPreviewedChange(change, preview, sourceForm));
+  $('#modalBackdrop').classList.remove('hidden');
+}
+
+// 确认提交同一操作 + 预演结果
+async function commitPreviewedChange(change, preview, sourceForm) {
+  const btn = $('#previewConfirm');
+  btn.disabled = true;
+  try {
+    const r = await api('POST', '/api/changes/commit', {
+      ...change,
+      basisVersion: preview.basisVersion,
+      impact: preview.impact,
+    });
+    $('#modalBackdrop').classList.add('hidden');
+    await loadState();
+    toast(`变更已执行（依据版本 ${r.basisVersion}）：${r.impact.length ? `${r.impact.length} 个已发布包标记为需复核` : '无已发布包受影响'}`);
+    // 若预演由授权表单发起，提交成功后复位该表单
+    if (sourceForm && sourceForm.matches('form[data-act="add-auth"]')) resetAuthForm(sourceForm);
+  } catch (err) {
+    btn.disabled = false;
+    if (err.status === 409 && err.details && (err.details.code === 'STALE_BASIS' || err.details.code === 'IMPACT_MISMATCH')) {
+      // 依据过期或影响清单漂移：关闭旧弹层，按当前数据重新预演并展示过期提示
+      let note = err.message;
+      if (err.details.code === 'IMPACT_MISMATCH') {
+        note += ' 已按当前数据重新预演，下方为最新影响清单。';
+      }
+      await loadState();
+      openChangePreview(change, note, sourceForm);
+    } else {
+      toast('提交被拒绝：' + errText(err), true);
+    }
+  }
+}
 
 loadState().catch((e) => toast('初始化失败：' + e.message, true));

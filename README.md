@@ -74,12 +74,22 @@ node test/e2e.js
      - 核验不通过（缺授权、日期不合法等）返回 `422`，包保持“待发布”，但本次尝试同样留存为不可变记录；
      - 通过则在**单个 SQLite 事务**内写入不可变核验快照（完整逐节点结果 JSON + 冻结清单 + 依据版本）并置为“已发布”。
 
-### 授权变更后的行为
+### 授权变更后的行为（先预演、再确认）
 
-- 授权增删改（含撤销）或来源关系增删后，系统立即重算所有已发布/需复核包。
-- **仅**状态由“合格”变为“不合格”的已发布包会被置为 `needs_review`（需复核），并**追加**一条新的复核快照；原发布快照一行不改、不会删除。
+- 授权的**单笔增/改/撤/删**或来源关系的**单条增/删**，界面默认「先做影响预演，再确认提交」（右上角开关可关闭，关闭后走既有编辑接口直接保存，行为与旧版一致）。
+- 预演输入字段沿用对应现有编辑接口与校验（媒介/地区非空、日期合法且起不晚于止、不得自环、新增来源不得成环等）；**预演只读**，在回滚型事务中模拟变更并重算，只返回：
+  - 因该变更将**由合格转为不合格的已发布展览包**（需复核包/待发布包不在其列）；
+  - 每个包的问题节点、原因（无授权 / 全部撤销 / 媒介不符 / 地区不符 / 日期不覆盖等）及全部来源路径；
+  - 预演所依据的 `basisVersion` 与影响清单指纹；预演**不改动**授权、关系、包状态或快照，依据版本也不变。
+- 确认时把**同一操作字段连同预演结果**（`basisVersion` + `impact`）一起提交。服务端在**单个事务内**：核对依据版本 → 重新校验输入/目标/成环 → 应用变更并重算影响 → 与预演清单比对 → 全部通过才提交。任一不符整体回滚、**无部分写入**：
+  - 依据版本不一致 → `409 STALE_BASIS`；
+  - 影响清单与重算结果不一致 → `409 IMPACT_MISMATCH`（响应里附服务端最新影响清单）；
+  - 预演后目标（授权/来源边）被删除或素材失效 → `409 TARGET_GONE`；
+  - 输入非法 → `400`；成环 → `409 CYCLE`（含 `cyclePath`/`cycle`）。
+  - 界面在过期/漂移时给出过期提示并可一键「重新预演」后再确认。
+- 成功后按现有规则执行：变更落库、仅把“合格→不合格”的已发布包置为 `needs_review` 并**追加**不可变复核快照；原发布快照一行不改、不会删除。
 - 需复核包不会自动恢复。补正授权后，在界面点「重新核验（人工复核）」：合格则恢复为已发布，不合格则保持需复核；两种结果都会再追加一条快照。
-- 已发布/需复核包的参数与清单不可编辑、不可删除；需要调整时点「复制为待发布包」走新一轮核验与发布。
+- 已有编辑接口（直接增删改）的请求与返回保持兼容；已发布/需复核包的参数与清单仍不可编辑、不可删除，需要调整时点「复制为待发布包」。
 
 ---
 
@@ -124,7 +134,67 @@ node test/e2e.js
 | `POST /api/verify` | 试核验（body 可传 `packageId` 或完整字段） |
 | `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；过期 409、不合格 422 |
 | `POST /api/packages/:id/recheck` | 对需复核包人工重新核验 |
+| `POST /api/changes/preview` | **变更影响预演**（只读）：单笔授权增改撤删 / 单条来源增删，返回将由合格转不合格的已发布包、问题节点、原因与依据版本 |
+| `POST /api/changes/commit` | **确认提交同一操作 + 预演结果**：事务内核版本、重算并比对影响清单；过期/不一致/目标失效/非法均整体拒绝 |
 | `GET /api/snapshots/:id` | 读取不可变快照完整内容 |
+
+### 影响预演 / 确认 API 调用示例
+
+请求体里的 `operation` 标识操作类型，其余字段与对应既有编辑接口完全一致。
+
+| operation | 对应既有接口 | 关键入参 |
+| --- | --- | --- |
+| `authorization.create` | `POST /api/materials/:id/authorizations` | `materialId, media, region, validFrom, validTo, revoked?, licensor?, note?` |
+| `authorization.update` | `PATCH /api/authorizations/:id` | `authorizationId` + 需修改字段（缺省沿用现值，含 `revoked`） |
+| `authorization.revoke` | `POST /api/authorizations/:id/revoke` | `authorizationId` |
+| `authorization.delete` | `DELETE /api/authorizations/:id` | `authorizationId` |
+| `source.create` | `POST /api/materials/:id/sources` | `materialId, sourceMaterialId, relation?` |
+| `source.delete` | `DELETE /api/source-links/:id` | `linkId` |
+
+第 1 步——预演（不落库）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/changes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"authorization.revoke","authorizationId":3}'
+# → { "ok": true, "basisVersion": 10,
+#     "impact": [ { "packageId": 1, "packageName": "常设展…",
+#                   "failingNodes": [ { "materialId": 3, "title": "城市航拍素材",
+#                                       "reasons": ["revoked"],
+#                                       "reasonText": ["该节点的授权均已撤销"],
+#                                       "paths": [ [ {"materialId":1,…}, {"materialId":3,…} ] ] } ] } ],
+#     "impactFingerprint": "…", "mutated": false }
+```
+
+第 2 步——把**同一操作字段**连同预演给出的 `basisVersion` 与 `impact` 原样回传确认：
+
+```bash
+curl -s -X POST http://localhost:3000/api/changes/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"authorization.revoke","authorizationId":3,
+       "basisVersion":10,"impact":[ /* 原样粘贴 preview 返回的 impact */ ]}'
+# → { "ok": true, "mutated": true, "basisVersion": 11, "impact": [ …同清单… ],
+#     "message": "变更已执行：1 个已发布包被标记为需复核并已追加不可变复核快照；需复核包不会自动恢复。" }
+```
+
+新增来源边的预演（成环在预演阶段即被拒绝）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/changes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"source.create","materialId":1,"sourceMaterialId":6,"relation":"引用"}'
+```
+
+可能的拒绝（均为 4xx，且不产生任何写入）：
+
+```text
+400  输入非法（空媒介/地区、日期非法或倒置、自环、缺少 id、未知 operation）
+409  CYCLE           新增来源将成环（details.cyclePath / details.cycle）
+409  STALE_BASIS     预演后授权/来源被他人改过（details.clientBasis/currentBasis）
+409  IMPACT_MISMATCH 影响清单与当前重算不符（details.impact 为最新清单，请重新预演）
+409  TARGET_GONE     预演后目标授权/来源边已被删除
+404  预演时目标不存在
+```
 
 ## 八、目录结构
 
@@ -137,11 +207,12 @@ node test/e2e.js
 ├── src
 │   ├── db.js               # SQLite 连接、建表、版本号/快照不可变触发器
 │   ├── verify.js           # 来源链遍历、成环检测、逐节点授权核验、发布后重算
-│   ├── server.js           # Express API（发布事务、依据过期拒绝）
+│   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（事务内核版本/比对影响）
+│   ├── server.js           # Express API（发布事务、依据过期拒绝、/api/changes/preview|commit）
 │   └── seed.js             # 演示数据
 ├── public                  # 浏览器前端（无构建）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（39 项）
+└── test/e2e.js             # 端到端业务规则自检（71 项）
 ```
