@@ -74,6 +74,18 @@ node test/e2e.js
      - 核验不通过（缺授权、日期不合法等）返回 `422`，包保持“待发布”，但本次尝试同样留存为不可变记录；
      - 通过则在**单个 SQLite 事务**内写入不可变核验快照（完整逐节点结果 JSON + 冻结清单 + 依据版本）并置为“已发布”。
 
+### 授权/来源变更前的影响预演与确认（本轮新增）
+
+馆员对**单笔授权**（新增 / 修改 / 撤销 / 删除）或**单条来源关系**（新增 / 删除）可以先做**影响预演**，确认无误后再提交：
+
+- 预演为**只读**操作：输入沿用相应现有编辑接口的字段与校验（媒介/地区/日期校验一致，会成环的关系同样被拒绝并返回闭环路径）；不改动授权、关系、包状态，也不写快照，依据版本不递增。
+- 预演只列出因该变更将**由合格转为不合格**的**已发布**展览包、问题节点、原因（无授权/已撤销/媒介不符/地区不符/日期不覆盖/成环）及问题来源路径，并给出**依据版本**与**影响清单指纹**（`basisVersion` + `impactFingerprint`）。
+- 确认时提交**同一操作字段**连同预演返回的依据版本与指纹。服务端在**单个 SQLite 事务**内：复查依据版本 → 复查目标有效性与输入合法性（含成环）→ 按当前数据**重算影响并比对指纹**；版本不符返回 `409 STALE_BASIS`、影响清单不符返回 `409 IMPACT_MISMATCH`、目标失效返回 `404`、输入非法返回 `400`，任一失败整体回滚，**不产生部分写入**。
+- 成功后按现有规则执行变更（依据版本递增）、把由合格转不合格的已发布包标记为 `needs_review` 并追加不可变 `review` 快照；原发布快照一行不改，**需复核包不会自动恢复**（仍需人工「重新核验」）。
+- 既有编辑接口（`POST/PATCH/DELETE /api/...`）的请求与返回**保持兼容**，依旧可以直接调用；前端素材页的撤销/删除/关系删除/授权修改等按钮已统一改为「先预演、面板确认」。
+
+界面：在「① 素材与来源」页，每条授权有「修改/预演」「撤销/预演」「删除/预演」，授权表单与来源表单旁有「预演影响」；预演结果展示在页面顶部面板（受影响包、问题节点、原因、路径、依据版本与过期提示），点「确认提交此变更」完成提交。若预演后数据被他人改过，确认会被拒绝并在面板显示按当前数据重算的最新影响，需重新预演。
+
 ### 授权变更后的行为
 
 - 授权增删改（含撤销）或来源关系增删后，系统立即重算所有已发布/需复核包。
@@ -124,7 +136,50 @@ node test/e2e.js
 | `POST /api/verify` | 试核验（body 可传 `packageId` 或完整字段） |
 | `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；过期 409、不合格 422 |
 | `POST /api/packages/:id/recheck` | 对需复核包人工重新核验 |
+| `POST /api/preview/impact` | **影响预演（只读）**，body 含 `op` 与相应编辑字段 |
+| `POST /api/preview/confirm` | **按预演确认提交**，追加 `basisVersion` + `impactFingerprint`；过期 409 `STALE_BASIS`、清单变化 409 `IMPACT_MISMATCH` |
 | `GET /api/snapshots/:id` | 读取不可变快照完整内容 |
+
+### 影响预演 / 确认 API 字段与调用示例
+
+`POST /api/preview/impact` 的 `op` 与字段（与现有编辑接口一一对应）：
+
+| `op` | 必填字段 | 对应现有接口 |
+| --- | --- | --- |
+| `authz_create` | `materialId`、`media`、`region`、`validFrom`、`validTo`（可选 `revoked`、`licensor`、`note`） | `POST /api/materials/:id/authorizations` |
+| `authz_update` | `authorizationId`，其余字段缺省沿用现值 | `PATCH /api/authorizations/:id` |
+| `authz_revoke` | `authorizationId` | `POST /api/authorizations/:id/revoke` |
+| `authz_delete` | `authorizationId` | `DELETE /api/authorizations/:id` |
+| `link_create` | `materialId`、`sourceMaterialId`（可选 `relation`），成环返回 409 + `cyclePath`/`cycle` | `POST /api/materials/:id/sources` |
+| `link_delete` | `linkId` | `DELETE /api/source-links/:id` |
+
+预演返回（节选）：`{ dryRun, op, operation, basisVersion, affectedCount, affectedPackages:[{ packageId, name, failingNodes:[{ materialId, title, reasons, reasonText, paths }] }], impactFingerprint, message }`。
+
+```bash
+# 1) 预演：撤销某授权（不写库）
+curl -s -X POST http://localhost:3000/api/preview/impact \
+  -H 'Content-Type: application/json' \
+  -d '{"op":"authz_revoke","authorizationId":1}'
+
+# 2) 用预演返回的 basisVersion / impactFingerprint 确认同一操作
+curl -s -X POST http://localhost:3000/api/preview/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"op":"authz_revoke","authorizationId":1,
+       "basisVersion":10,
+       "impactFingerprint":"a0ce8bf9143f747d570e8486cb8175ad2e294692ce1e5ff34ed0892758a7ee00"}'
+
+# 预演新增/修改授权
+curl -s -X POST http://localhost:3000/api/preview/impact -H 'Content-Type: application/json' -d '{
+  "op":"authz_update","authorizationId":3,
+  "media":"屏幕放映","region":"中国大陆",
+  "validFrom":"2025-01-01","validTo":"2027-06-30"}'
+
+# 预演新增来源关系（会成环时与现有接口一样 409 并给闭环）
+curl -s -X POST http://localhost:3000/api/preview/impact -H 'Content-Type: application/json' -d '{
+  "op":"link_create","materialId":5,"sourceMaterialId":4,"relation":"引用"}'
+```
+
+确认失败时的响应：`409 { details.code: "STALE_BASIS", clientBasis, currentBasis, impact, impactFingerprint }` 或 `409 { details.code: "IMPACT_MISMATCH", impact, impactFingerprint }`——两者的 `details` 都带按当前数据重算的最新影响与新指纹，前端据此提示过期并支持重新预演；此时无任何写入。
 
 ## 八、目录结构
 
@@ -136,10 +191,11 @@ node test/e2e.js
 ├── package.json
 ├── src
 │   ├── db.js               # SQLite 连接、建表、版本号/快照不可变触发器
-│   ├── verify.js           # 来源链遍历、成环检测、逐节点授权核验、发布后重算
-│   ├── server.js           # Express API（发布事务、依据过期拒绝）
+│   ├── verify.js           # 来源链遍历、成环检测、逐节点授权核验、发布后重算（支持内存 overlay 模拟态）
+│   ├── impact.js           # 变更影响预演/确认：同一套校验、影响清单指纹、事务内版本+影响双校验
+│   ├── server.js           # Express API（发布事务、依据过期拒绝、预演/确认 API）
 │   └── seed.js             # 演示数据
-├── public                  # 浏览器前端（无构建）
+├── public                  # 浏览器前端（无构建，素材页含影响预演面板）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js

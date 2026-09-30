@@ -10,6 +10,12 @@ const {
   verifyPackage,
   revalidatePublished,
 } = require('./verify');
+const {
+  OpError,
+  buildPlan,
+  preview: previewChange,
+  confirmChange,
+} = require('./impact');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -218,8 +224,12 @@ app.post('/api/materials/:id/sources', (req, res, next) => {
     }
 
     tx(() => {
-      db.prepare('INSERT INTO source_links(material_id, source_material_id, relation, created_at) VALUES (?,?,?,?)')
-        .run(materialId, sourceId, str(req.body.relation).trim() || '使用', nowIso());
+      const plan = buildPlan(db, 'link_create', {
+        materialId,
+        sourceMaterialId: sourceId,
+        relation: req.body.relation,
+      });
+      plan.run(db);
       revalidatePublished(db);
     });
     res.status(201).json(materialDTO(loadMaterial(materialId)));
@@ -232,7 +242,7 @@ app.delete('/api/source-links/:id', (req, res, next) => {
     const link = db.prepare('SELECT * FROM source_links WHERE id=?').get(id);
     if (!link) throw new HttpError(404, `来源关系 #${id} 不存在`);
     tx(() => {
-      db.prepare('DELETE FROM source_links WHERE id=?').run(id);
+      buildPlan(db, 'link_delete', { linkId: id }).run(db);
       revalidatePublished(db);
     });
     res.status(204).end();
@@ -244,42 +254,20 @@ app.post('/api/materials/:id/authorizations', (req, res, next) => {
   try {
     const materialId = Number(req.params.id);
     loadMaterial(materialId);
-    const { medium, region } = validateScope(req.body);
-    const validFrom = str(req.body.validFrom).trim();
-    const validTo = str(req.body.validTo).trim();
-    validateDateRange(validFrom, validTo);
-    const revoked = req.body.revoked ? 1 : 0;
-    const info = db
-      .prepare(
-        `INSERT INTO authorizations(material_id, media, region, valid_from, valid_to, revoked, licensor, note, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`
-      )
-      .run(materialId, medium, region, validFrom, validTo, revoked,
-        str(req.body.licensor).trim() || null, str(req.body.note).trim() || null, nowIso(), nowIso());
-    tx(() => revalidatePublished(db));
-    res.status(201).json(authDTO(db.prepare('SELECT * FROM authorizations WHERE id=?').get(info.lastInsertRowid)));
+    const info = tx(() => {
+      const newId = buildPlan(db, 'authz_create', { ...req.body, materialId }).run(db);
+      revalidatePublished(db);
+      return newId;
+    });
+    res.status(201).json(authDTO(db.prepare('SELECT * FROM authorizations WHERE id=?').get(info)));
   } catch (e) { next(e); }
 });
 
 app.patch('/api/authorizations/:id', (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const a = db.prepare('SELECT * FROM authorizations WHERE id=?').get(id);
-    if (!a) throw new HttpError(404, `授权 #${id} 不存在`);
-    const medium = str(req.body.media ?? a.media).trim();
-    const region = str(req.body.region ?? a.region).trim();
-    const validFrom = str(req.body.validFrom ?? a.valid_from).trim();
-    const validTo = str(req.body.validTo ?? a.valid_to).trim();
-    const licensor = req.body.licensor === undefined ? a.licensor : str(req.body.licensor).trim() || null;
-    const note = req.body.note === undefined ? a.note : str(req.body.note).trim() || null;
-    if (!medium) throw new HttpError(400, '媒介不能为空');
-    if (!region) throw new HttpError(400, '地区不能为空');
-    validateDateRange(validFrom, validTo);
-    const revoked = req.body.revoked === undefined ? a.revoked : (req.body.revoked ? 1 : 0);
     tx(() => {
-      db.prepare(
-        `UPDATE authorizations SET media=?, region=?, valid_from=?, valid_to=?, revoked=?, licensor=?, note=?, updated_at=? WHERE id=?`
-      ).run(medium, region, validFrom, validTo, revoked, licensor, note, nowIso(), id);
+      buildPlan(db, 'authz_update', { ...req.body, authorizationId: id }).run(db);
       revalidatePublished(db);
     });
     res.json(authDTO(db.prepare('SELECT * FROM authorizations WHERE id=?').get(id)));
@@ -289,10 +277,8 @@ app.patch('/api/authorizations/:id', (req, res, next) => {
 app.post('/api/authorizations/:id/revoke', (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const a = db.prepare('SELECT * FROM authorizations WHERE id=?').get(id);
-    if (!a) throw new HttpError(404, `授权 #${id} 不存在`);
     tx(() => {
-      db.prepare('UPDATE authorizations SET revoked=1, updated_at=? WHERE id=?').run(nowIso(), id);
+      buildPlan(db, 'authz_revoke', { authorizationId: id }).run(db);
       revalidatePublished(db);
     });
     res.json(authDTO(db.prepare('SELECT * FROM authorizations WHERE id=?').get(id)));
@@ -302,10 +288,8 @@ app.post('/api/authorizations/:id/revoke', (req, res, next) => {
 app.delete('/api/authorizations/:id', (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const a = db.prepare('SELECT * FROM authorizations WHERE id=?').get(id);
-    if (!a) throw new HttpError(404, `授权 #${id} 不存在`);
     tx(() => {
-      db.prepare('DELETE FROM authorizations WHERE id=?').run(id);
+      buildPlan(db, 'authz_delete', { authorizationId: id }).run(db);
       revalidatePublished(db);
     });
     res.status(204).end();
@@ -564,9 +548,73 @@ app.get('/api/snapshots/:id', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 变更影响预演 / 确认（只读预演 + 事务内版本/影响双校验提交） ----------
+const PREVIEW_OPS = [
+  'authz_create', 'authz_update', 'authz_revoke', 'authz_delete',
+  'link_create', 'link_delete',
+];
+
+// POST /api/preview/impact
+// body: { op, materialId?, authorizationId?, linkId?, sourceMaterialId?, relation?,
+//         media/medium?, region?, validFrom?, validTo?, revoked?, licensor?, note? }
+// 只读：不改授权、不改关系、不改包状态、不写快照。
+app.post('/api/preview/impact', (req, res, next) => {
+  try {
+    const op = str(req.body.op).trim();
+    if (!PREVIEW_OPS.includes(op)) {
+      throw new HttpError(400, `缺少或不支持的 op（支持：${PREVIEW_OPS.join(' / ')}）`);
+    }
+    res.json(previewChange(db, op, previewBody(req.body)));
+  } catch (e) { next(e); }
+});
+
+// POST /api/preview/confirm
+// body: 同预演字段 + { basisVersion, impactFingerprint }
+// 事务内复查依据版本/输入/目标并比对影响清单；任一不一致整体回滚，无部分写入。
+// 成功后执行变更、把由合格转不合格的已发布包标为需复核并追加不可变快照。
+app.post('/api/preview/confirm', (req, res, next) => {
+  try {
+    const op = str(req.body.op).trim();
+    if (!PREVIEW_OPS.includes(op)) {
+      throw new HttpError(400, `缺少或不支持的 op（支持：${PREVIEW_OPS.join(' / ')}）`);
+    }
+    const result = confirmChange(db, tx, op, previewBody(req.body));
+
+    // 附带与既有编辑接口一致的资源表示（请求/返回保持兼容）
+    if (op === 'authz_create' && result.targetId) {
+      result.authorization = authDTO(db.prepare('SELECT * FROM authorizations WHERE id=?').get(result.targetId));
+    }
+    if (op === 'link_create') {
+      const materialId = Number(req.body.materialId);
+      result.material = materialDTO(loadMaterial(materialId));
+    }
+    res.status(201).json(result);
+  } catch (e) { next(e); }
+});
+
+function previewBody(body) {
+  return {
+    materialId: body.materialId,
+    authorizationId: body.authorizationId,
+    linkId: body.linkId,
+    sourceMaterialId: body.sourceMaterialId,
+    relation: body.relation,
+    media: body.media,
+    medium: body.medium,
+    region: body.region,
+    validFrom: body.validFrom,
+    validTo: body.validTo,
+    revoked: body.revoked,
+    licensor: body.licensor,
+    note: body.note,
+    basisVersion: body.basisVersion,
+    impactFingerprint: body.impactFingerprint,
+  };
+}
+
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError) {
+  if (err instanceof HttpError || err instanceof OpError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {

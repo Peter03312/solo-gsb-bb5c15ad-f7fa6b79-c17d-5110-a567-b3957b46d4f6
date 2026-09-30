@@ -3,7 +3,7 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const state = { materials: [], packages: [], basisVersion: 0 };
+const state = { materials: [], packages: [], basisVersion: 0, authEdit: null };
 
 async function api(method, url, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -82,7 +82,7 @@ function renderMaterials() {
       <div>${m.sources.map((s) => `
         <span class="chip">← ${esc(s.sourceTitle)}
           <span class="small-muted">(${esc(s.relation)})</span>
-          <button title="删除来源关系" data-act="del-link" data-id="${s.id}">×</button>
+          <button title="预演删除该来源关系的影响" data-act="preview-del-link" data-id="${s.id}">×</button>
         </span>`).join('') || '<span class="small-muted">无</span>'}
       </div>
       <form class="mini" data-act="add-link">
@@ -94,6 +94,8 @@ function renderMaterials() {
         </select>
         <input name="relation" placeholder="关系（如 配乐）" style="width:110px" />
         <button class="btn btn-small" type="submit">＋ 来源</button>
+        <button class="btn btn-small" type="button" data-act="preview-link-add"
+          title="先预演此变更对已发布包的影响，不写入任何数据">预演影响</button>
       </form>
 
       <div class="section-title">授权</div>
@@ -107,24 +109,44 @@ function renderMaterials() {
               <td>${a.revoked ? '<span class="pill pill-bad">已撤销</span>' : '<span class="pill pill-ok">有效</span>'}</td>
               <td>${esc(a.licensor || '')}</td>
               <td class="pkg-actions">
-                ${a.revoked ? '' : `<button class="btn btn-small" data-act="revoke" data-id="${a.id}">撤销</button>`}
-                <button class="btn btn-small btn-danger" data-act="del-auth" data-id="${a.id}">删除</button>
+                <button class="btn btn-small" data-act="preview-edit-auth" data-id="${a.id}">修改/预演</button>
+                ${a.revoked ? '' : `<button class="btn btn-small" data-act="preview-revoke" data-id="${a.id}">撤销/预演</button>`}
+                <button class="btn btn-small btn-danger" data-act="preview-del-auth" data-id="${a.id}">删除/预演</button>
               </td>
             </tr>`).join('')}
         </table>` : '<span class="small-muted">无授权登记</span>'}
-      <form class="mini" data-act="add-auth">
+      <form class="mini" data-act="add-auth" data-material="${m.id}">
         <input type="hidden" name="materialId" value="${m.id}" />
+        <input type="hidden" name="authorizationId" value="" />
+        <span class="auth-form-label">＋ 授权</span>
         <input name="media" placeholder="媒介（* 任意）" style="width:100px" required />
         <input name="region" placeholder="地区（* 任意）" style="width:100px" required />
         <input name="validFrom" type="date" required />
         <input name="validTo" type="date" required />
+        <label class="rev-check"><input type="checkbox" name="revoked" /> 已撤销</label>
         <input name="licensor" placeholder="授权方" style="width:100px" />
-        <button class="btn btn-small" type="submit">＋ 授权</button>
+        <input name="note" placeholder="备注" style="width:110px" />
+        <button class="btn btn-small" type="submit" data-act-submit="save">保存</button>
+        <button class="btn btn-small" type="button" data-act="preview-save-auth"
+          title="先预演此授权（新增或修改）对已发布包的影响，不写入任何数据">预演影响</button>
+        <button class="btn btn-small hidden" type="button" data-act="cancel-edit-auth">取消修改</button>
       </form>
 
       <div class="section-title">被用于</div>
       <div>${m.usedBy.map((u) => `<span class="chip">${esc(u.materialTitle)} <span class="small-muted">(${esc(u.relation)})</span></span>`).join('') || '<span class="small-muted">无</span>'}</div>
     </div>`).join('');
+
+  // 重新渲染后若处于“修改授权”模式，把对应表单重新置为编辑态
+  if (state.authEdit) {
+    for (const mm of state.materials) {
+      const a = mm.authorizations.find((x) => x.id === state.authEdit);
+      if (a) {
+        const card = document.querySelector(`.card[data-id="${mm.id}"]`);
+        if (card) fillAuthForm(card, a);
+        break;
+      }
+    }
+  }
 }
 
 $('#addMaterialForm').addEventListener('submit', async (e) => {
@@ -138,24 +160,198 @@ $('#addMaterialForm').addEventListener('submit', async (e) => {
   } catch (err) { toast(errText(err), true); }
 });
 
+// ---------------- 变更影响预演面板 ----------------
+let impactState = null; // 当前预演结果：{ result, op, body }
+
+function authBodyFromForm(form) {
+  const body = {
+    media: form.media.value, region: form.region.value,
+    validFrom: form.validFrom.value, validTo: form.validTo.value,
+    revoked: form.revoked.checked,
+    licensor: form.licensor.value, note: form.note.value,
+  };
+  const authId = form.authorizationId.value;
+  return { body, authId: authId ? Number(authId) : null, materialId: Number(form.materialId.value) };
+}
+
+async function requestImpact(op, body) {
+  try {
+    const result = await api('POST', '/api/preview/impact', { op, ...body });
+    impactState = { result, op, body };
+    renderImpact(result, op);
+    $('#impactPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (err) {
+    impactState = null;
+    hideImpact();
+    if (err.status === 409 && err.details && err.details.cyclePath) {
+      const cycle = err.details.cycle || err.details.cyclePath;
+      const names = cycle.map((id) => {
+        const mm = state.materials.find((x) => x.id === id);
+        return mm ? mm.title : `#${id}`;
+      });
+      toast(`${err.message} 闭环路径：${names.join(' → ')}`, true);
+    } else toast(errText(err), true);
+  }
+}
+
+function hideImpact() { $('#impactPanel').classList.add('hidden'); $('#impactPanel').innerHTML = ''; }
+
+function renderImpact(result, op) {
+  const panel = $('#impactPanel');
+  panel.classList.remove('hidden');
+  const staleHint = `
+    <div class="impact-stale">
+      ⏳ 此预演基于<b>依据版本 ${result.basisVersion}</b>。预演不会改动任何数据；若确认前他人修改了授权或来源关系，
+      确认将因依据过期（409 STALE_BASIS）被拒绝，需重新预演。
+    </div>`;
+  const list = result.affectedCount === 0
+    ? '<div class="impact-empty">✓ 该变更不会使任何已发布展览包由合格转为不合格。</div>'
+    : result.affectedPackages.map((p) => `
+      <div class="impact-pkg">
+        <div class="impact-pkg-head">
+          <b>${esc(p.name)}</b> <span class="small-muted">#${p.packageId}</span>
+          <span class="pill pill-warn">已发布 → 需复核</span>
+        </div>
+        ${p.failingNodes.map((n) => `
+          <div class="impact-node">
+            <span class="fail-node">${esc(n.title)}</span>
+            <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span>
+            ${n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}
+            <div class="small-muted">问题来源路径（${n.paths.length} 条）：</div>
+            ${n.paths.map((pp) => '<div class="path">' + pp.map((x, i) =>
+              (i ? ' → ' : '') + `<span class="${x.materialId === n.materialId ? 'fail-node' : ''}">${esc(x.title)}</span>`).join('') + '</div>').join('')}
+          </div>`).join('')}
+      </div>`).join('');
+  panel.innerHTML = `
+    <div class="impact-head">
+      <h2>变更影响预演 <span class="pill pill-neutral">只读 · 不写入</span></h2>
+      <div class="small-muted">${esc(result.opText)}：${esc(result.operation)}</div>
+    </div>
+    <div class="verdict ${result.affectedCount === 0 ? 'pass' : 'fail'}">
+      ${esc(result.message)}
+      <span class="sub">预演依据版本 ${result.basisVersion}（提交时服务端会再次比对当前版本）</span>
+    </div>
+    ${staleHint}
+    <div class="impact-list">${list}</div>
+    <div class="pkg-actions" style="margin-top:10px">
+      <button class="btn btn-primary" id="impactConfirmBtn">确认提交此变更</button>
+      <button class="btn" id="impactCancelBtn">取消</button>
+      <span class="small-muted">确认时服务端会在事务内再次校验依据版本并重算影响；版本或影响清单不一致将整体拒绝，不产生部分写入。成功后${
+        result.affectedCount === 0 ? '仅执行变更。' : '受影响包将标记需复核并追加不可变快照（原发布快照保留，需复核包不自动恢复）。'}</span>
+    </div>`;
+  $('#impactCancelBtn').addEventListener('click', hideImpact);
+  $('#impactConfirmBtn').addEventListener('click', () => doImpactConfirm(op));
+}
+
+async function doImpactConfirm(op) {
+  if (!impactState) return;
+  const { result, body } = impactState;
+  const btn = $('#impactConfirmBtn');
+  btn.disabled = true;
+  try {
+    const payload = { ...body, basisVersion: result.basisVersion, impactFingerprint: result.impactFingerprint };
+    const r = await api('POST', '/api/preview/confirm', payload);
+    hideImpact();
+    impactState = null;
+    toast(r.affectedCount === 0
+      ? `变更已提交（依据版本 ${r.basisVersion} → ${r.newBasisVersion}），无已发布包受影响`
+      : `变更已提交：${r.affectedCount} 个已发布包标记需复核，不可变复核快照已追加`);
+    state.authEdit = null;
+    await loadState();
+  } catch (err) {
+    if (err.status === 409 && err.details && (err.details.code === 'STALE_BASIS' || err.details.code === 'IMPACT_MISMATCH')) {
+      // 依据过期/清单不一致：已被服务端拒绝且无写入；展示按当前数据重算的最新影响，要求重新预演
+      const fresh = err.details.impact;
+      toast('预演已过期或影响清单已变化：已拒绝提交，无任何写入。请核对后重新预演。', true);
+      if (fresh) {
+        impactState = {
+          result: {
+            ...fresh,
+            dryRun: true, opText: impactState.result.opText, operation: impactState.result.operation,
+            message: '以下为按当前数据重算的最新影响（仅展示）。若仍要提交，请重新发起一次预演再确认。',
+          },
+          op,
+          body: impactState.body,
+        };
+        renderImpact(impactState.result, op);
+        $('#impactPanel').insertAdjacentHTML('afterbegin',
+          '<div class="errorline">⚠ ' + esc(err.message) + '</div>');
+        const cbtn = $('#impactConfirmBtn');
+        if (cbtn) {
+          cbtn.disabled = true;
+          cbtn.textContent = '依据已过期，请重新预演';
+        }
+      }
+    } else toast(errText(err), true);
+  } finally {
+    const b = $('#impactConfirmBtn');
+    if (b) b.disabled = false;
+  }
+}
+
+// 授权表单：新增 / 修改两种模式
+function fillAuthForm(card, a) {
+  const form = card.querySelector('form[data-act="add-auth"]');
+  const label = form.querySelector('.auth-form-label');
+  if (a) {
+    state.authEdit = a.id;
+    form.authorizationId.value = a.id;
+    form.media.value = a.media;
+    form.region.value = a.region;
+    form.validFrom.value = a.validFrom;
+    form.validTo.value = a.validTo;
+    form.revoked.checked = !!a.revoked;
+    form.licensor.value = a.licensor || '';
+    form.note.value = a.note || '';
+    label.textContent = `修改授权 #${a.id}`;
+    form.querySelector('[data-act-submit]').textContent = '保存修改';
+    form.querySelector('[data-act="cancel-edit-auth"]').classList.remove('hidden');
+  } else {
+    state.authEdit = null;
+    form.reset();
+    form.authorizationId.value = '';
+    label.textContent = '＋ 授权';
+    form.querySelector('[data-act-submit]').textContent = '保存';
+    form.querySelector('[data-act="cancel-edit-auth"]').classList.add('hidden');
+  }
+}
+
 $('#materialsList').addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
+  const card = e.target.closest('.card');
+  const act = btn.dataset.act;
   try {
-    if (btn.dataset.act === 'del-link') {
-      if (!confirm('删除该来源关系？（可能影响已发布包资格）')) return;
-      await api('DELETE', `/api/source-links/${btn.dataset.id}`);
-      toast('来源关系已删除，已重新计算已发布包资格');
-    } else if (btn.dataset.act === 'revoke') {
-      if (!confirm('撤销该授权？依赖它的已发布包将被标记为需复核。')) return;
-      await api('POST', `/api/authorizations/${btn.dataset.id}/revoke`);
-      toast('授权已撤销，已重新计算已发布包资格');
-    } else if (btn.dataset.act === 'del-auth') {
-      if (!confirm('删除该授权？此变更不可从快照中追溯恢复。')) return;
-      await api('DELETE', `/api/authorizations/${btn.dataset.id}`);
-      toast('授权已删除，已重新计算已发布包资格');
+    if (act === 'preview-revoke') {
+      await requestImpact('authz_revoke', { authorizationId: Number(btn.dataset.id) });
+    } else if (act === 'preview-del-auth') {
+      await requestImpact('authz_delete', { authorizationId: Number(btn.dataset.id) });
+    } else if (act === 'preview-edit-auth') {
+      const a = state.materials.flatMap((m) => m.authorizations).find((x) => x.id === Number(btn.dataset.id));
+      if (!card) return;
+      fillAuthForm(card, a);
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      toast('已载入授权到下方表单，修改后点「预演影响」');
+    } else if (act === 'cancel-edit-auth') {
+      fillAuthForm(card, null);
+    } else if (act === 'preview-del-link') {
+      await requestImpact('link_delete', { linkId: Number(btn.dataset.id) });
+    } else if (act === 'preview-link-add') {
+      const form = card.querySelector('form[data-act="add-link"]');
+      if (!form.sourceMaterialId.value) { toast('请先选择来源素材', true); return; }
+      await requestImpact('link_create', {
+        materialId: Number(form.materialId.value),
+        sourceMaterialId: Number(form.sourceMaterialId.value),
+        relation: form.relation.value,
+      });
+    } else if (act === 'preview-save-auth') {
+      const form = card.querySelector('form[data-act="add-auth"]');
+      form.reportValidity();
+      if (!form.checkValidity()) return;
+      const { body, authId, materialId } = authBodyFromForm(form);
+      await requestImpact(authId ? 'authz_update' : 'authz_create',
+        authId ? { ...body, authorizationId: authId } : { ...body, materialId });
     }
-    await loadState();
   } catch (err) { toast(errText(err), true); }
 });
 
@@ -169,14 +365,17 @@ $('#materialsList').addEventListener('submit', async (e) => {
         sourceMaterialId: Number(form.sourceMaterialId.value),
         relation: form.relation.value,
       });
-      toast('来源关系已登记');
+      toast('来源关系已登记，已重新计算已发布包资格');
     } else if (form.dataset.act === 'add-auth') {
-      await api('POST', `/api/materials/${form.materialId.value}/authorizations`, {
-        media: form.media.value, region: form.region.value,
-        validFrom: form.validFrom.value, validTo: form.validTo.value,
-        licensor: form.licensor.value,
-      });
-      toast('授权已登记');
+      const { body, authId, materialId } = authBodyFromForm(form);
+      if (authId) {
+        await api('PATCH', `/api/authorizations/${authId}`, body);
+        toast('授权已修改，已重新计算已发布包资格');
+      } else {
+        await api('POST', `/api/materials/${materialId}/authorizations`, body);
+        toast('授权已登记');
+      }
+      state.authEdit = null;
     }
     await loadState();
   } catch (err) {

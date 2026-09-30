@@ -17,14 +17,18 @@ function scopeMatches(value, wanted) {
   return String(value).trim().toLowerCase() === String(wanted).trim().toLowerCase();
 }
 
-function loadGraph(db) {
-  const links = db.prepare('SELECT material_id, source_material_id FROM source_links').all();
+function graphFromRows(links) {
   const adj = new Map();
   for (const l of links) {
     if (!adj.has(l.material_id)) adj.set(l.material_id, []);
     adj.get(l.material_id).push(l.source_material_id);
   }
   return adj;
+}
+
+function loadGraph(db) {
+  const links = db.prepare('SELECT material_id, source_material_id FROM source_links').all();
+  return graphFromRows(links);
 }
 
 // BFS：从 from 到 to 的任意一条路径（含两端）。用于新增来源边时的成环预判。
@@ -174,8 +178,9 @@ function verifyPackage(db, input) {
   }
   const roots = materialIds.filter((id) => matById.has(id));
 
-  const adj = loadGraph(db);
-  const authRows = db.prepare('SELECT * FROM authorizations').all();
+  const overlay = input.overlay || null;
+  const adj = overlay ? graphFromRows(overlay.links) : loadGraph(db);
+  let authRows = overlay ? overlay.auths : db.prepare('SELECT * FROM authorizations').all();
   const authByMat = new Map();
   for (const a of authRows) {
     if (!authByMat.has(a.material_id)) authByMat.set(a.material_id, []);
@@ -342,6 +347,7 @@ module.exports = {
   isValidDate,
   scopeMatches,
   loadGraph,
+  graphFromRows,
   findPath,
   basisVersion,
   verifyPackage,
